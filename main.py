@@ -1,22 +1,16 @@
-import os
 import uvicorn
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from neo4j import GraphDatabase
-from dotenv import load_dotenv
-from typing import List
+from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
+import json
+import logging
+from models import *
+from helpers import *
 
-# Load environment variables
-load_dotenv()
-
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER")
-NEO4J_PASS = os.getenv("NEO4J_PASS")
-NEO4J_DB = os.getenv("NEO4J_DB")
-
-# Initialize Neo4j driver
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # FastAPI instance
 app = FastAPI()
@@ -29,74 +23,92 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Models for requests
-class NodeCreateRequest(BaseModel):
-    labels: list[str]
-    properties: dict[str, str]
+@app.middleware("http")
+async def wrap_success_responses(request: Request, call_next):
+    body = await request.body()
+    print("📥 Raw body:", body)
+    print("📋 Headers:", request.headers)
+    try:
+        response = await call_next(request)
 
-class NodePair(BaseModel):
-    from_id: int
-    to_id: int
+        # Skip wrapping errors or already-JSON responses
+        if response.status_code >= 400:
+            return response
 
-class RelationshipCreateRequest(BaseModel):
-    pairs: List[NodePair]
-    relationship: str
+        # Only wrap JSON responses
+        if hasattr(response, "media_type") and response.media_type == "application/json":
+            body = b"".join([chunk async for chunk in response.body_iterator])
+            response.body_iterator = iter([body])
+            try:
+                data = json.loads(body)
+            except Exception:
+                data = body.decode()
 
-class NodeUpdateRequest(BaseModel):
-    id: int
-    updates: dict
+            # If already has 'success', leave it
+            if isinstance(data, dict) and "success" in data:
+                return response
 
-class NodeDeleteRequest(BaseModel):
-    id: int
+            message = "Success"
+            if isinstance(data, dict) and "message" in data:
+                message = data.pop("message")
 
-class BaseRequest(BaseModel):
-    user_id: int
-    tab_id: int
-
-# Utility function to run Cypher queries
-async def run_query(query: str, parameters: dict = {}):
-    with driver.session(database=NEO4J_DB) as session:
-        result = session.run(query, parameters)
-        return list(result) # Fetch all records before session closes
-    
-app.get("/")
-def root():
-    return {
-        "message": "Welcome to the neo4j api for OSINT app",
-        "routes": {
-            "/add-records": "Run an OSINT task with the specified source and query.",
-            "/graph": "Get the result of a task by its ID.",
-            "/delete-records": "Fetch all results from the database.",
-        }
-    }
+            # Wrap into standard format
+            wrapped = {
+                "success": True,
+                "message": message,
+                "data": data,
+            }
+            finalResponse = JSONResponse(content=wrapped, status_code=response.status_code)
+            print("📥 Response:", finalResponse)
+            return finalResponse
+        return response
+    except Exception as e:
+        # Let global handler deal with unhandled errors
+        raise e
 
 # Route to add a node
-@app.post("/add-record/{user_id}/{tab_id}/{source_node_id}")
-async def add_node(user_id: int, tab_id: int, source_node_id: str,request: List[NodeCreateRequest]):
+@app.post("/add-node")
+async def add_node(request: NodeCreateRequest):
     query = """
     UNWIND $nodes AS node
     CREATE (n)
-    SET n = node.properties
-    SET n.user_id = $user_id, n.tab_id = $tab_id
+    SET n += node.properties
+    SET n.uuid = randomUUID()
+    SET n.user_id = $user_id,
+        n.graph_id = $graph_id,
+        n.project_id = $project_id
     WITH n, node
     CALL apoc.create.addLabels(n, node.labels) YIELD node as updatedNode
-    RETURN id(n) as id, labels(n) as labels, apoc.map.removeKeys(n, ['user_id', 'tab_id']) AS properties
+    RETURN elementId(n) as id,
+           labels(n) as labels,
+           apoc.map.removeKeys(n, ['user_id', 'graph_id', 'project_id']) AS properties
     """
     
     # print(request)
 
     # Convert request to a list of dictionaries with labels and properties
-    nodes_data = [{"labels": node.labels, "properties": node.properties} for node in request]
+    nodes_data = [{"labels": node.labels, "properties": node.properties} for node in request.nodes]
 
     result = await run_query(query, {
-        "nodes":nodes_data,
-        "user_id": user_id,
-        "tab_id": tab_id
+        "nodes": nodes_data,
+        "graph_id": request.graph_id,
+        "user_id": request.user_id,
+        "project_id": request.project_id
     })
     records = result
     if not records:
         raise HTTPException(status_code=500, detail="Failed to add node")
-    return {"message": "Node added successfully", "nodes": records, "source_node_id":source_node_id}
+    
+    return {
+        "message": "Nodes added successfully",
+        "nodes": result,
+        # "source_node_ids": [n.source_node_id for n in request.nodes]
+    }
+
+# @app.post("/debug")
+# async def debug(req: dict):
+#     print(req)
+#     return req
 
 # Route to view all nodes
 @app.get("/view-nodes")
@@ -107,20 +119,30 @@ async def view_nodes():
     return {"nodes": nodes}
 
 # Route to get the full graph (nodes + relationships)
-@app.post("/graph")
-async def get_graph(request: BaseRequest):
+@app.get("/graph")
+async def get_graph():
+    # query = """
+    # MATCH (n)
+    # WHERE n.user_id = $user_id AND n.project_id = $project_id AND n.graph_id = $graph_id
+    # OPTIONAL MATCH (n)-[r]->(m)
+    # WHERE m.user_id = $user_id AND m.project_id = $project_id AND m.graph_id = $graph_id
+    # RETURN {
+    #     id: elementId(n),
+    #     labels: labels(n),
+    #     properties: apoc.map.removeKeys(n, ['user_id', 'project_id', 'graph_id'])
+    # } AS n, r, m
+    # """
     query = """
     MATCH (n)
-    WHERE n.user_id = $user_id AND n.tab_id = $tab_id
     OPTIONAL MATCH (n)-[r]->(m)
-    WHERE m.user_id = $user_id AND m.tab_id = $tab_id
     RETURN {
-        id: id(n),
+        id: elementId(n),
         labels: labels(n),
-        properties: apoc.map.removeKeys(n, ['user_id', 'tab_id'])
+        properties: apoc.map.removeKeys(n, ['user_id', 'project_id', 'graph_id'])
     } AS n, r, m
     """
-    result = await run_query(query, {"user_id": request.user_id, "tab_id": request.tab_id})
+    # result = await run_query(query, {"user_id": request.user_id, "project_id": request.project_id, "graph_id": request.graph_id})
+    result = await run_query(query)
 
     nodes = []
     edges = []
@@ -151,8 +173,8 @@ async def get_graph(request: BaseRequest):
 async def add_relationship(request: RelationshipCreateRequest):
     query = """
     UNWIND $pairs AS pair
-    MATCH (a) WHERE id(a)=pair.from_node
-    MATCH (b) WHERE id(b)=pair.to_node
+    MATCH (a) WHERE elementId(a)=pair.from_node
+    MATCH (b) WHERE elementId(b)=pair.to_node
     CALL apoc.create.relationship(a, $relationship, {}, b) YIELD rel as r
     RETURN collect(r) AS relationships
     """
@@ -162,14 +184,14 @@ async def add_relationship(request: RelationshipCreateRequest):
         raise HTTPException(status_code=500, detail="Failed to create relationship")
     return {"message": "Relationship created successfully", "relationship": result[0]["relationships"]}
 
-# Route to update a node
-@app.put("/update-node")
+# Route to edit nodes
+@app.put("/edit-nodes")
 async def update_node(request: NodeUpdateRequest):
     if not request.updates:
         raise HTTPException(status_code=400, detail="Updates are required")
 
     set_query = ", ".join([f"n.{key} = ${key}" for key in request.updates.keys()])
-    query = f"MATCH (n) WHERE id(n) = $id SET {set_query} RETURN n"
+    query = f"MATCH (n) WHERE elementId(n) = $id SET {set_query} RETURN n"
 
     parameters = {"id": request.id, **request.updates}
     result = await run_query(query, parameters)
@@ -182,17 +204,39 @@ async def update_node(request: NodeUpdateRequest):
 @app.delete("/delete-node/{node_id}")
 async def delete_node(node_id: int):
     print(node_id)
-    query = "MATCH (n) WHERE ID(n)=$id DETACH DELETE n"
-    # AND n.user_id = $user_id AND n.tab_id = $tab_id
+    query = "MATCH (n) WHERE elementId(n)=$id DETACH DELETE n"
+    # AND n.user_id = $user_id AND n.project_id = $project_id
     await run_query(query, {"id": node_id})
     return {"message": "Node deleted successfully"}
 
 # Route to delete all nodes
-@app.delete("/delete-all-nodes")
+@app.delete("/delete-all")
 async def delete_node(request: BaseRequest = Body(...)):
-    query = "MATCH (n) WHERE n.user_id = $user_id AND n.tab_id = $tab_id DETACH DELETE n"
-    await run_query(query, {"user_id": request.user_id, "tab_id": request.tab_id})
+    query = "MATCH (n) WHERE n.user_id = $user_id AND n.project_id = $project_id DETACH DELETE n"
+    await run_query(query, {"user_id": request.user_id, "project_id": request.project_id})
     return {"message": "Nodes deleted successfully"}
+
+@app.exception_handler(Exception)
+def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled error: {exc}")
+    return JSONResponse(
+        status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "success": False,
+            "message": "There is a problem with our servers. Please try again later.",
+            "code": "SERVER_ERROR"
+        },
+    )
+
+@app.exception_handler(HTTPException)
+def http_exception_handler(request: Request, exc: HTTPException):
+    # If developer raises HTTPException(detail=...)
+    if isinstance(exc.detail, dict):
+        return JSONResponse(status_code=exc.status_code, content=exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"success": False, "message": str(exc.detail)},
+    )
 
 # Run the FastAPI server
 if __name__ == "__main__":
