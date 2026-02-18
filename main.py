@@ -202,7 +202,7 @@ async def update_node(request: NodeUpdateRequest):
 
 # Route to delete a node
 @app.delete("/delete-node/{node_id}")
-async def delete_node(node_id: int):
+async def delete_node(node_id: UUID):
     print(node_id)
     query = "MATCH (n) WHERE elementId(n)=$id DETACH DELETE n"
     # AND n.user_id = $user_id AND n.project_id = $project_id
