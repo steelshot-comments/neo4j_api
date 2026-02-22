@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from uuid import UUID
-from typing import List
+from typing import List, Any
 
 class BaseRequest(BaseModel):
     user_id: UUID
@@ -9,7 +9,7 @@ class BaseRequest(BaseModel):
 
 class NodePayload(BaseModel):
     labels: list[str]
-    properties: dict[str, str]
+    properties: dict[str, Any]
     # source_node_id: str
 
 class NodeCreateRequest(BaseRequest):

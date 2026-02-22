@@ -83,25 +83,31 @@ async def add_node(request: NodeCreateRequest):
            labels(n) as labels,
            apoc.map.removeKeys(n, ['user_id', 'graph_id', 'project_id']) AS properties
     """
-    
-    # print(request)
 
     # Convert request to a list of dictionaries with labels and properties
     nodes_data = [{"labels": node.labels, "properties": node.properties} for node in request.nodes]
 
     result = await run_query(query, {
         "nodes": nodes_data,
-        "graph_id": request.graph_id,
-        "user_id": request.user_id,
-        "project_id": request.project_id
+        "graph_id": str(request.graph_id),
+        "user_id": str(request.user_id),
+        "project_id": str(request.project_id)
     })
-    records = result
-    if not records:
+    
+    if not result:
         raise HTTPException(status_code=500, detail="Failed to add node")
     
+    formatted_nodes = []
+    for record in result:
+        formatted_nodes.append({
+            "id": record["id"],
+            "labels": record["labels"],
+            "properties": record["properties"]
+        })
+
     return {
         "message": "Nodes added successfully",
-        "nodes": result,
+        "nodes": formatted_nodes
         # "source_node_ids": [n.source_node_id for n in request.nodes]
     }
 
@@ -120,29 +126,20 @@ async def view_nodes():
 
 # Route to get the full graph (nodes + relationships)
 @app.get("/graph")
-async def get_graph():
-    # query = """
-    # MATCH (n)
-    # WHERE n.user_id = $user_id AND n.project_id = $project_id AND n.graph_id = $graph_id
-    # OPTIONAL MATCH (n)-[r]->(m)
-    # WHERE m.user_id = $user_id AND m.project_id = $project_id AND m.graph_id = $graph_id
-    # RETURN {
-    #     id: elementId(n),
-    #     labels: labels(n),
-    #     properties: apoc.map.removeKeys(n, ['user_id', 'project_id', 'graph_id'])
-    # } AS n, r, m
-    # """
+async def get_graph(request: BaseRequest):
     query = """
     MATCH (n)
+    WHERE n.user_id = $user_id AND n.project_id = $project_id AND n.graph_id = $graph_id
     OPTIONAL MATCH (n)-[r]->(m)
+    WHERE m.user_id = $user_id AND m.project_id = $project_id AND m.graph_id = $graph_id
     RETURN {
         id: elementId(n),
         labels: labels(n),
         properties: apoc.map.removeKeys(n, ['user_id', 'project_id', 'graph_id'])
     } AS n, r, m
     """
-    # result = await run_query(query, {"user_id": request.user_id, "project_id": request.project_id, "graph_id": request.graph_id})
-    result = await run_query(query)
+
+    result = await run_query(query, {"user_id": request.user_id, "project_id": request.project_id, "graph_id": request.graph_id})
 
     nodes = []
     edges = []
