@@ -28,4 +28,4 @@ class NodeUpdateRequest(BaseRequest):
     updates: dict
 
 class NodeDeleteRequest(BaseRequest):
-    id: UUID
+    ids: List[str]

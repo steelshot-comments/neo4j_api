@@ -198,13 +198,23 @@ async def update_node(request: NodeUpdateRequest):
     return {"message": "Node updated successfully", "node": records[0]["n"]}
 
 # Route to delete a node
-@app.delete("/delete-node/{node_id}")
-async def delete_node(node_id: UUID):
-    print(node_id)
-    query = "MATCH (n) WHERE elementId(n)=$id DETACH DELETE n"
-    # AND n.user_id = $user_id AND n.project_id = $project_id
-    await run_query(query, {"id": node_id})
-    return {"message": "Node deleted successfully"}
+@app.delete("/delete-node")
+async def delete_node(request: NodeDeleteRequest):
+    query = """
+    UNWIND $ids AS node_id
+    MATCH (n)
+    WHERE elementId(n) = node_id
+    AND n.user_id = $user_id
+    DETACH DELETE n
+    """
+    
+    params = {
+        "ids": request.ids,
+        "user_id": str(request.user_id)
+    }
+    
+    await run_query(query, params)
+    return {"message": f"Successfully deleted {len(request.ids)} nodes"}
 
 # Route to delete all nodes
 @app.delete("/delete-all")
